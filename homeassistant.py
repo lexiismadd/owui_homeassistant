@@ -3,7 +3,7 @@ title: Home Assistant
 author: lexiismadd
 author_url: https://github.com/lexiismadd
 funding_url: https://github.com/open-webui
-version: 2.0.0
+version: 2.1.0
 license: MIT
 requirements: aiohttp, loguru
 description: Home Assistant tool with smart area-prioritized entity detection and intelligent matching.
@@ -54,10 +54,19 @@ class Tools:
             default=0.5,
             description="Minimum score (0-1) for global search fallback to be considered a valid match.",
         )
+        COMPACT_RESULTS: bool = Field(
+            default=False,
+            description="Return a compact control_home_assistant result (best match plus up to 4 alternatives, no explanations). Recommended for small local models with limited context.",
+        )
+        STATE_WAIT_SECONDS: float = Field(
+            default=1.5,
+            description="Seconds to wait after a state-changing service call before reading the entity's new state.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
         self._ws = None
+        self._ws_session = None
         self._ws_message_id = 0
         self._entity_cache = None
         self._area_cache = None
@@ -73,18 +82,23 @@ class Tools:
         if self.valves.USE_WEBSOCKET:
             if self._ws is None or self._ws.closed:
                 ws_url = f"{self.valves.HA_URL.rstrip('/')}/api/websocket"
-                async with aiohttp.ClientSession() as session:
-                    self._ws = await session.ws_connect(ws_url)
-                    # Authenticate
-                    auth_msg = await self._ws.receive_json()
-                    if auth_msg["type"] == "auth_required":
-                        await self._ws.send_json({
-                            "type": "auth",
-                            "access_token": self.valves.HA_TOKEN
-                        })
-                        auth_result = await self._ws.receive_json()
-                        if auth_result["type"] != "auth_ok":
-                            raise Exception("WebSocket authentication failed")
+                # Keep the ClientSession open for the lifetime of the WebSocket.
+                # Creating it in an "async with" block closed the session (and the
+                # socket's transport) as soon as authentication finished, so every
+                # later command failed with "Cannot write to closing transport".
+                if self._ws_session is None or self._ws_session.closed:
+                    self._ws_session = aiohttp.ClientSession()
+                self._ws = await self._ws_session.ws_connect(ws_url)
+                # Authenticate
+                auth_msg = await self._ws.receive_json()
+                if auth_msg["type"] == "auth_required":
+                    await self._ws.send_json({
+                        "type": "auth",
+                        "access_token": self.valves.HA_TOKEN
+                    })
+                    auth_result = await self._ws.receive_json()
+                    if auth_result["type"] != "auth_ok":
+                        raise Exception("WebSocket authentication failed")
         return self._ws
 
     async def _ws_send_command(self, command: dict, timeout: float = 10.0) -> dict:
@@ -108,6 +122,9 @@ class Tools:
         if self._ws and not self._ws.closed:
             await self._ws.close()
             self._ws = None
+        if self._ws_session is not None and not self._ws_session.closed:
+            await self._ws_session.close()
+            self._ws_session = None
 
     # =========================================================================
     # REST API Helper
@@ -439,6 +456,11 @@ class Tools:
         
         # Action words and patterns to remove
         action_patterns = [
+            # Strip "turn on/off" and "switch on/off" first. Otherwise the generic
+            # pattern below removes only "turn", and the location pattern then
+            # treats "on <name> lights" as a location phrase and deletes the device
+            # name entirely ("turn on desk lights" -> "").
+            r"^(turn|switch)\s+(on|off)\s+",
             r"^(turn|switch|set|get|check|what's|whats|what is|is the|are the)\s+",
             r"\s+(on|off|up|down|to|in|at|for)$",
             r"\s+(on|off|up|down)$",
@@ -889,6 +911,32 @@ class Tools:
                 }
             else:
                 best_match = top_matches[0]
+                if self.valves.COMPACT_RESULTS:
+                    result = {
+                        "best_match": {
+                            "entity_id": best_match["entity_id"],
+                            "friendly_name": best_match["friendly_name"],
+                            "area": best_match["area_name"],
+                            "state": best_match["entity"].get("state", "unknown"),
+                        },
+                        "other_matches": [
+                            {
+                                "entity_id": m["entity_id"],
+                                "friendly_name": m["friendly_name"],
+                                "state": m["entity"].get("state", "unknown"),
+                            }
+                            for m in top_matches[1:5]
+                        ],
+                        "next": "Use the EXACT entity_id with execute_action (get_state or call_service).",
+                    }
+                    if __event_emitter__:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {"description": f"Found {len(top_matches)} matching entities", "done": True},
+                            }
+                        )
+                    return result
                 detected_area_name = detected_area["area_name"] if detected_area else None
                 
                 result = {
@@ -1125,7 +1173,7 @@ class Tools:
 
                 # If this was a state-changing action, get the updated state
                 if service in ["turn_on", "turn_off", "toggle", "set_temperature", "set_brightness"]:
-                    await asyncio.sleep(1.5)  # Wait for state to update
+                    await asyncio.sleep(max(0.0, self.valves.STATE_WAIT_SECONDS))  # Wait for state to update
                     action_type = "get_state"
 
             if action_type == "get_state":
